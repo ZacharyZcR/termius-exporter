@@ -1,0 +1,8 @@
+node_modules/
+*.log
+tmpclaude-*
+
+# Output files (sensitive data)
+L00t.csv
+ssh_keys/
+snippets.csv
