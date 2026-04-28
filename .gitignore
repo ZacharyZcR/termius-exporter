@@ -3,6 +3,7 @@ node_modules/
 tmpclaude-*
 
 # Output files (sensitive data)
-L00t.csv
+#L00t.csv #deprecated, use snippets.csv instead
 ssh_keys/
 snippets.csv
+termius_hosts.csv
