@@ -12,17 +12,126 @@ const sodium = require('libsodium-wrappers');
 const keytar = require('keytar');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 const BOM = '\ufeff';
-const DB_PATH = path.join(process.env.APPDATA, 'Termius/IndexedDB/file__0.indexeddb.leveldb/');
+
+// Termius (Electron) \u5728\u4e0d\u540c\u7cfb\u7edf\u4e0b\u7684\u5e94\u7528\u6570\u636e\u6839\u76ee\u5f55
+// macOS \u4e0a\u5206\u4e24\u79cd\u53d1\u884c\u7248\uff1a
+//   - Mac App Store \u6c99\u76d2\u7248 (com.termius.mac)\uff1a\u6570\u636e\u5728 Containers \u5bb9\u5668\u5185
+//   - \u5b98\u7f51\u76f4\u88c5\u7248\uff1a\u6570\u636e\u5728\u6807\u51c6\u7684 Application Support \u4e0b
+const LEVELDB_SUBPATH = ['Termius', 'IndexedDB', 'file__0.indexeddb.leveldb'];
+
+function getTermiusDbCandidates() {
+  const home = os.homedir();
+
+  switch (process.platform) {
+    case 'win32': {
+      const base = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
+      return [path.join(base, ...LEVELDB_SUBPATH)];
+    }
+    case 'darwin': {
+      const sandbox = path.join(home, 'Library', 'Containers', 'com.termius.mac',
+        'Data', 'Library', 'Application Support');
+      const standard = path.join(home, 'Library', 'Application Support');
+      return [
+        path.join(sandbox, ...LEVELDB_SUBPATH),   // App Store \u6c99\u76d2\u7248\uff08\u4f18\u5148\uff09
+        path.join(standard, ...LEVELDB_SUBPATH),  // \u76f4\u88c5\u7248
+      ];
+    }
+    default: { // linux \u7b49
+      const base = process.env.XDG_CONFIG_HOME || path.join(home, '.config');
+      return [path.join(base, ...LEVELDB_SUBPATH)];
+    }
+  }
+}
+
+function getTermiusDbPath() {
+  const candidates = getTermiusDbCandidates();
+  return candidates.find(p => fs.existsSync(p)) || candidates[0];
+}
+
+const DB_PATH = getTermiusDbPath();
 const OUTPUT_DIR = __dirname;
 
 // ==================== 解密模块 ====================
 
+// 不同发行版的密钥在钥匙串中的存放位置不同（服务名/账户名都可能不同），
+// 因此先按已知组合尝试，失败后自动枚举候选服务下的账户来发现正确的密钥。
+const KEY_SERVICES = ['Termius', 'com.termius.mac'];
+const KEY_ACCOUNTS = ['localKey', 'TermiusKey', 'key', 'masterKey'];
+
+// 把用户提供的字符串解析成 32 字节密钥（支持 base64 或 64 位 hex）
+function parseManualKey(raw) {
+  const s = raw.trim();
+
+  // 64 位十六进制
+  if (/^[0-9a-fA-F]{64}$/.test(s)) {
+    return Buffer.from(s, 'hex');
+  }
+
+  // base64（容错：去掉空白）
+  const buf = Buffer.from(s.replace(/\s+/g, ''), 'base64');
+  if (buf.length === 32) return buf;
+
+  throw new Error(
+    `提供的密钥无法解析为 32 字节。\n` +
+    `  得到 ${buf.length} 字节。请确认从钥匙串复制的是完整的 base64 值（约 44 个字符，通常以 "=" 结尾）。`
+  );
+}
+
 async function getEncryptionKey() {
-  const key = await keytar.getPassword('Termius', 'localKey');
-  if (!key) throw new Error('未找到 Termius 加密密钥，请确保已登录 Termius');
-  return Buffer.from(key, 'base64');
+  // 0) 手动提供密钥：环境变量 TERMIUS_KEY 或命令行 --key=...
+  const argKey = process.argv.find(a => a.startsWith('--key='));
+  const manual = process.env.TERMIUS_KEY || (argKey && argKey.slice('--key='.length));
+  if (manual) {
+    const key = parseManualKey(manual);
+    console.log('    ✓ 使用手动提供的密钥');
+    return key;
+  }
+
+  // 1) 已知 (service, account) 组合的定向读取
+  for (const service of KEY_SERVICES) {
+    for (const account of KEY_ACCOUNTS) {
+      const v = await keytar.getPassword(service, account);
+      if (v) {
+        console.log(`    ✓ 命中钥匙串项: service="${service}" account="${account}"`);
+        return Buffer.from(v, 'base64');
+      }
+    }
+  }
+
+  // 2) 自动发现：列出候选服务下的所有账户
+  const discovered = [];
+  for (const service of KEY_SERVICES) {
+    let creds = [];
+    try {
+      creds = await keytar.findCredentials(service);
+    } catch {
+      continue;
+    }
+    for (const { account, password } of creds) {
+      discovered.push(`${service} / ${account}`);
+      // 加密密钥通常是 base64 的 32 字节(=44 字符)随机串
+      if (password && /^[A-Za-z0-9+/]{42,}={0,2}$/.test(password)) {
+        console.log(`    ✓ 自动发现密钥: service="${service}" account="${account}"`);
+        return Buffer.from(password, 'base64');
+      }
+    }
+  }
+
+  const found = discovered.length
+    ? `\n钥匙串中发现以下相关项：\n  - ${discovered.join('\n  - ')}`
+    : '\n未能通过脚本读取钥匙串（沙盒版 Termius 的密钥有 ACL 保护，node 进程无权读取）。';
+
+  const manualHint =
+    '\n\n请手动提供密钥：' +
+    '\n  1) 打开“钥匙串访问 (Keychain Access)”，搜索 “Termius”' +
+    '\n  2) 双击对应项 → 勾选“显示密码”，输入登录密码后复制该值（约 44 个字符的 base64）' +
+    '\n  3) 重新运行：  TERMIUS_KEY=\'粘贴的值\' node termius-exporter.js' +
+    '\n     或：        node termius-exporter.js --key=\'粘贴的值\'';
+
+  throw new Error('未找到 Termius 加密密钥。' + found + manualHint);
 }
 
 async function decrypt(base64Data, key) {
@@ -45,6 +154,10 @@ async function decrypt(base64Data, key) {
 }
 
 async function extractAndDecrypt(key) {
+  if (!fs.existsSync(DB_PATH)) {
+    throw new Error(`未找到 Termius 数据库目录:\n  ${DB_PATH}\n请确认 Termius 已安装并至少登录过一次。`);
+  }
+
   const files = fs.readdirSync(DB_PATH).filter(f => f.endsWith('.log') || f.endsWith('.ldb'));
 
   let allData = '';
