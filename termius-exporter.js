@@ -182,7 +182,7 @@ function exportSshKeys(keysByLabel) {
     if (!k.private_key) return;
     const safeName = label.replace(/[<>:"/\\|?*]/g, '_');
 
-    if (!k.private_key.endsWith('\n')) k.private_key = k.private_key + '\n';
+    if (!k.private_key.endsWith('\n')) k.private_key += '\n';
 
     const pemPath = path.join(keysDir, `${safeName}.pem`);
     fs.writeFileSync(pemPath, k.private_key, { mode: 0o600 });
