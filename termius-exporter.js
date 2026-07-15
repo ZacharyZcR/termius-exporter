@@ -17,24 +17,95 @@ const os = require('os');
 const BOM = '﻿';
 const OUTPUT_DIR = __dirname;
 
+const LEVELDB_SUBPATH = ['Termius', 'IndexedDB', 'file__0.indexeddb.leveldb'];
+
+function getDbCandidates() {
+  const home = os.homedir();
+  switch (process.platform) {
+    case 'darwin': {
+      const sandbox = path.join(home, 'Library', 'Containers', 'com.termius.mac',
+        'Data', 'Library', 'Application Support');
+      const standard = path.join(home, 'Library', 'Application Support');
+      return [
+        path.join(sandbox, ...LEVELDB_SUBPATH),
+        path.join(standard, ...LEVELDB_SUBPATH),
+      ];
+    }
+    case 'win32': {
+      const base = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
+      return [path.join(base, ...LEVELDB_SUBPATH)];
+    }
+    default: {
+      const base = process.env.XDG_CONFIG_HOME || path.join(home, '.config');
+      return [path.join(base, ...LEVELDB_SUBPATH)];
+    }
+  }
+}
+
 function getDbPath() {
-  if (process.platform === 'darwin') {
-    return path.join(os.homedir(), 'Library/Application Support/Termius/IndexedDB/file__0.indexeddb.leveldb');
-  }
-  if (process.platform === 'win32') {
-    if (!process.env.APPDATA) throw new Error('APPDATA environment variable is not set');
-    return path.join(process.env.APPDATA, 'Termius/IndexedDB/file__0.indexeddb.leveldb');
-  }
-  // Linux: XDG_CONFIG_HOME or ~/.config
-  return path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'), 'Termius/IndexedDB/file__0.indexeddb.leveldb');
+  const candidates = getDbCandidates();
+  return candidates.find(p => fs.existsSync(p)) || candidates[0];
 }
 
 // ==================== Decryption ====================
 
+const KEY_SERVICES = ['Termius', 'com.termius.mac'];
+const KEY_ACCOUNTS = ['localKey', 'TermiusKey', 'key', 'masterKey'];
+
+function parseManualKey(raw) {
+  const s = raw.trim();
+  if (/^[0-9a-fA-F]{64}$/.test(s)) return Buffer.from(s, 'hex');
+  const buf = Buffer.from(s.replace(/\s+/g, ''), 'base64');
+  if (buf.length === 32) return buf;
+  throw new Error(
+    `Provided key does not decode to 32 bytes (got ${buf.length}).` +
+    ` Make sure you copied the full base64 value (~44 chars, usually ending with "=").`
+  );
+}
+
 async function getEncryptionKey() {
-  const key = await keytar.getPassword('Termius', 'localKey');
-  if (!key) throw new Error('Termius encryption key not found — make sure you are logged in to Termius');
-  return Buffer.from(key, 'base64');
+  const argKey = process.argv.find(a => a.startsWith('--key='));
+  const manual = process.env.TERMIUS_KEY || (argKey && argKey.slice('--key='.length));
+  if (manual) {
+    console.log('    ✓ Using manually provided key');
+    return parseManualKey(manual);
+  }
+
+  for (const service of KEY_SERVICES) {
+    for (const account of KEY_ACCOUNTS) {
+      const v = await keytar.getPassword(service, account);
+      if (v) {
+        console.log(`    ✓ Found keychain entry: service="${service}" account="${account}"`);
+        return Buffer.from(v, 'base64');
+      }
+    }
+  }
+
+  const discovered = [];
+  for (const service of KEY_SERVICES) {
+    try {
+      for (const { account, password } of await keytar.findCredentials(service)) {
+        discovered.push(`${service} / ${account}`);
+        if (password && /^[A-Za-z0-9+/]{42,}={0,2}$/.test(password)) {
+          console.log(`    ✓ Auto-discovered key: service="${service}" account="${account}"`);
+          return Buffer.from(password, 'base64');
+        }
+      }
+    } catch {}
+  }
+
+  const found = discovered.length
+    ? `\nKeychain entries found:\n  - ${discovered.join('\n  - ')}`
+    : '\nCould not read keychain (sandboxed Termius keys are ACL-protected).';
+
+  throw new Error(
+    'Termius encryption key not found.' + found +
+    '\n\nManual key fallback:' +
+    '\n  1) Open Keychain Access, search "Termius"' +
+    '\n  2) Double-click the entry → check "Show password", copy the value (~44 char base64)' +
+    '\n  3) Re-run:  TERMIUS_KEY=\'<value>\' node termius-exporter.js' +
+    '\n     or:     node termius-exporter.js --key=\'<value>\''
+  );
 }
 
 async function decrypt(base64Data, key) {
@@ -182,8 +253,11 @@ function exportSshKeys(keysByLabel) {
     if (!k.private_key) return;
     const safeName = label.replace(/[<>:"/\\|?*]/g, '_');
 
+    let keyContent = k.private_key;
+    if (!keyContent.endsWith('\n')) keyContent += '\n';
+
     const pemPath = path.join(keysDir, `${safeName}.pem`);
-    fs.writeFileSync(pemPath, k.private_key, { mode: 0o600 });
+    fs.writeFileSync(pemPath, keyContent, { mode: 0o600 });
 
     if (k.passphrase) {
       const ppPath = path.join(keysDir, `${safeName}.passphrase`);
