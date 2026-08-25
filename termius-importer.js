@@ -6,7 +6,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const readline = require('readline');
 
 const INPUT_CSV = path.join(__dirname, 'termius_hosts.csv');
 const OUTPUT_CSV = path.join(__dirname, 'termius_import_ready.csv');
@@ -23,29 +22,22 @@ async function main() {
   let output = 'Groups,Label,Tags,Hostname/IP,Protocol,Port,Username,Password\n';
   let count = 0;
 
-  const rl = readline.createInterface({
-    input: fs.createReadStream(INPUT_CSV)
-  });
+  const rows = parseCSV(fs.readFileSync(INPUT_CSV, 'utf8').replace(/^\uFEFF/, ''));
+  for (const fields of rows.slice(1)) {
+    if (fields.length < 2 || fields.every(field => !field)) continue;
 
-  let isHeader = true;
-  for await (const line of rl) {
-    if (isHeader) { isHeader = false; continue; }
-
-    const fields = parseCSVLine(line);
-    if (fields.length < 2) continue;
-
-    const [label, host, port, username, password, sshKey] = fields.map(f => (f || '').trim());
+    const [label, host, port, username, password] = fields.map(f => (f || '').trim());
 
     // Map to new format
     output += [
       "",                    // Groups (empty for now)
-      `"${label}"`,          // Label
+      escapeCSV(label),      // Label
       "",                    // Tags
-      `"${host}"`,           // Hostname/IP
+      escapeCSV(host),       // Hostname/IP
       "ssh",                 // Protocol
       port || "22",          // Port
-      `"${username}"`,       // Username
-      `"${password}"`        // Password
+      escapeCSV(username),   // Username
+      escapeCSV(password)    // Password
     ].join(',') + '\n';
 
     count++;
@@ -61,9 +53,44 @@ async function main() {
   console.log('4. Review and click Import');
 }
 
-function parseCSVLine(line) {
-  return line.match(/(".*?"|[^",]+)(?=\s*,|\s*$)/g)
-    ?.map(f => f.replace(/^"|"$/g, '').replace(/""/g, '"')) || [];
+function parseCSV(input) {
+  const rows = [];
+  let row = [];
+  let field = '';
+  let quoted = false;
+
+  for (let i = 0; i < input.length; i++) {
+    const char = input[i];
+    if (char === '"') {
+      if (quoted && input[i + 1] === '"') {
+        field += '"';
+        i++;
+      } else {
+        quoted = !quoted;
+      }
+    } else if (char === ',' && !quoted) {
+      row.push(field);
+      field = '';
+    } else if ((char === '\n' || char === '\r') && !quoted) {
+      if (char === '\r' && input[i + 1] === '\n') i++;
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = '';
+    } else {
+      field += char;
+    }
+  }
+
+  if (field || row.length) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows;
+}
+
+function escapeCSV(value) {
+  return `"${String(value || '').replace(/"/g, '""')}"`;
 }
 
 main().catch(err => console.error('Error:', err.message));
